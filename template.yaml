@@ -1,0 +1,327 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Event-driven S3 file processing with Lambda in a private subnet and SNS email alerts.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Globally unique lowercase S3 bucket name (3-63 chars).
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Use 3-63 lowercase letters, numbers, dots or hyphens; start/end with a letter or number.
+  NotificationEmail:
+    Type: String
+    Description: Email address that will receive SNS alerts.
+  LatestPythonRuntime:
+    Type: String
+    Default: python3.12
+    AllowedValues:
+      - python3.12
+      - python3.13
+    Description: Python runtime supported by Lambda in the selected region.
+
+Resources:
+  ProcessingVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: FileProcessing-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: FileProcessing-IGW
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref ProcessingVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProcessingVPC
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: FileProcessing-Public-Subnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProcessingVPC
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: FileProcessing-Private-Subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ProcessingVPC
+      Tags:
+        - Key: Name
+          Value: FileProcessing-Public-RT
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachInternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachInternetGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: FileProcessing-NAT-EIP
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: PublicSubnetRouteAssociation
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      ConnectivityType: public
+      Tags:
+        - Key: Name
+          Value: FileProcessing-NAT
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ProcessingVPC
+      Tags:
+        - Key: Name
+          Value: FileProcessing-Private-RT
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ProcessingVPC
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow outbound connections from file-processing Lambda.
+      VpcId: !Ref ProcessingVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: FileProcessing-Lambda-SG
+
+  FileProcessingTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: FileProcessingAlerts
+      DisplayName: File Processing Alerts
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref FileProcessingTopic
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadWriteAndSNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadUploadedObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${BucketName}/incoming/*'
+              - Sid: WriteProcessedMetadata
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${BucketName}/processed/*'
+              - Sid: PublishProcessingAlerts
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref FileProcessingTopic
+
+  FileProcessingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-FileProcessor'
+      Runtime: !Ref LatestPythonRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref FileProcessingTopic
+          OUTPUT_PREFIX: processed/
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import urllib.parse
+          from datetime import datetime, timezone
+
+          s3 = boto3.client("s3")
+          sns = boto3.client("sns")
+
+          def lambda_handler(event, context):
+              records = event.get("Records", [])
+              results = []
+
+              for record in records:
+                  if record.get("eventSource") != "aws:s3":
+                      continue
+
+                  bucket = record["s3"]["bucket"]["name"]
+                  key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+
+                  # The notification is filtered to incoming/; this is an extra safety check.
+                  if not key.startswith("incoming/"):
+                      continue
+
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  body = response["Body"]
+                  byte_count = response.get("ContentLength", 0)
+                  body.close()
+
+                  metadata = {
+                      "status": "SUCCESS",
+                      "source_bucket": bucket,
+                      "source_key": key,
+                      "size_bytes": byte_count,
+                      "processed_at_utc": datetime.now(timezone.utc).isoformat(),
+                      "request_id": getattr(context, "aws_request_id", "local-test")
+                  }
+
+                  output_key = os.environ.get("OUTPUT_PREFIX", "processed/") + \
+                      key.rsplit("/", 1)[-1] + ".metadata.json"
+
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=output_key,
+                      Body=json.dumps(metadata, indent=2).encode("utf-8"),
+                      ContentType="application/json"
+                  )
+
+                  sns.publish(
+                      TopicArn=os.environ["SNS_TOPIC_ARN"],
+                      Subject="S3 file processed successfully",
+                      Message=json.dumps(metadata, indent=2)
+                  )
+                  results.append({"bucket": bucket, "source_key": key, "output_key": output_key})
+
+              return {"statusCode": 200, "processed": results}
+
+  AllowS3InvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt FileProcessingFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:aws:s3:::${BucketName}'
+
+  FileUploadBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - AllowS3InvokeLambda
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt FileProcessingFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+
+Outputs:
+  BucketName:
+    Description: Upload test files to the incoming/ prefix in this bucket.
+    Value: !Ref FileUploadBucket
+  LambdaFunctionName:
+    Value: !Ref FileProcessingFunction
+  LambdaFunctionArn:
+    Value: !GetAtt FileProcessingFunction.Arn
+  SNSTopicArn:
+    Value: !Ref FileProcessingTopic
+  VPCId:
+    Value: !Ref ProcessingVPC
+  PublicSubnetId:
+    Value: !Ref PublicSubnet
+  PrivateSubnetId:
+    Value: !Ref PrivateSubnet
