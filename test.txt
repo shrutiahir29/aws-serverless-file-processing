@@ -1,0 +1,4 @@
+
+This is my AWS Teacher Assessment 2 test file.
+The file is uploaded to Amazon S3 to test
+event-driven serverless file processing.
